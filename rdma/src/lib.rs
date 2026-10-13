@@ -118,7 +118,7 @@ impl Nic {
         len: u16,
     ) -> io::Result<()> {
         let o = local.offset as usize;
-        let mut pkt = header(OP_WRITE, wr_id, remote, len).to_vec();
+        let mut pkt = header(OP_WRITE, wr_id, remote, len).as_bytes().to_vec();
         pkt.extend_from_slice(&self.mem(local.region)[o..o + len as usize]);
         self.sock.send(&pkt).map(drop)
     }
@@ -126,7 +126,7 @@ impl Nic {
     /// Copies `len` bytes from remote `remote` to local `local`.
     pub fn post_read(&mut self, wr_id: u64, local: Addr, remote: Addr, len: u16) -> io::Result<()> {
         // Padded to the response size so the remote NIC fills it in place.
-        let mut pkt = header(OP_READ, wr_id, remote, len).to_vec();
+        let mut pkt = header(OP_READ, wr_id, remote, len).as_bytes().to_vec();
         pkt.resize(HDR_LEN + len as usize, 0);
         self.sock.send(&pkt)?;
         self.reads.insert(wr_id, (local, len));
@@ -138,17 +138,18 @@ impl Nic {
         let mut buf = [0; HDR_LEN + MAX_MSG];
         loop {
             let n = self.sock.recv(&mut buf)?;
-            let Some(h) = buf[..n].first_chunk().map(Header::decode) else {
+            let Ok((h, payload)) = Header::read_from_prefix(&buf[..n]) else {
                 continue;
             };
+            let wr_id = h.wr_id.get();
             let mut ok = h.status == STATUS_OK;
             match h.op {
                 OP_WRITE_ACK => {}
                 OP_READ_RESP => {
-                    let Some((local, len)) = self.reads.remove(&h.wr_id) else {
+                    let Some((local, len)) = self.reads.remove(&wr_id) else {
                         continue;
                     };
-                    match buf[..n].get(HDR_LEN..HDR_LEN + len as usize) {
+                    match payload.get(..len as usize) {
                         Some(data) if ok => {
                             let o = local.offset as usize;
                             self.mem(local.region)[o..o + data.len()].copy_from_slice(data);
@@ -158,7 +159,7 @@ impl Nic {
                 }
                 _ => continue,
             }
-            return Ok(Completion { wr_id: h.wr_id, ok });
+            return Ok(Completion { wr_id, ok });
         }
     }
 }
@@ -169,16 +170,15 @@ impl Drop for Nic {
     }
 }
 
-fn header(op: u8, wr_id: u64, remote: Addr, len: u16) -> [u8; HDR_LEN] {
+fn header(op: u8, wr_id: u64, remote: Addr, len: u16) -> Header {
     Header {
         op,
         status: STATUS_OK,
-        len,
-        region: remote.region,
-        offset: remote.offset,
-        wr_id,
+        len: len.into(),
+        region: remote.region.into(),
+        offset: remote.offset.into(),
+        wr_id: wr_id.into(),
     }
-    .encode()
 }
 
 /// Out-of-band exchange: serves `(region, len)` to the first peer that connects.

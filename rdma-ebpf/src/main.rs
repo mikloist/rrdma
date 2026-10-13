@@ -40,7 +40,8 @@ pub fn rdma(ctx: XdpContext) -> u32 {
     if !ours {
         return XDP_PASS;
     }
-    let h = Header::decode(unsafe { &*(p.add(HDR_OFF) as *const [u8; HDR_LEN]) });
+    // Copy, not a reference: the helper calls in `access` invalidate packet pointers.
+    let h = unsafe { *(p.add(HDR_OFF) as *const Header) };
     let reply = match h.op {
         OP_WRITE => OP_WRITE_ACK,
         OP_READ => OP_READ_RESP,
@@ -59,8 +60,9 @@ pub fn rdma(ctx: XdpContext) -> u32 {
         return XDP_DROP;
     };
     unsafe {
-        *p.add(HDR_OFF) = reply;
-        *p.add(HDR_OFF + 1) = status;
+        let hdr = &mut *(p.add(HDR_OFF) as *mut Header);
+        hdr.op = reply;
+        hdr.status = status;
         swap(p, 0, 6, 6); // MACs
         swap(p, IP_OFF + 12, IP_OFF + 16, 4); // IPs
         swap(p, UDP_OFF, UDP_OFF + 2, 2); // ports
@@ -79,14 +81,14 @@ fn headers(ctx: &XdpContext) -> Option<*mut u8> {
 /// Copies payload ↔ region memory. The "DMA".
 #[inline(always)]
 fn access(ctx: &XdpContext, h: &Header) -> bool {
-    if !remote_ok(h.region, h.offset, h.len) {
+    if !h.remote_ok() {
         return false;
     }
-    let Some(slot) = REGIONS.get_ptr_mut(h.region) else {
+    let Some(slot) = REGIONS.get_ptr_mut(h.region.get()) else {
         return false;
     };
-    let mem = unsafe { (slot as *mut u8).add(h.offset as usize) }.cast();
-    let len = core::hint::black_box(h.len as u32).clamp(1, MAX_MSG as u32);
+    let mem = unsafe { (slot as *mut u8).add(h.offset.get() as usize) }.cast();
+    let len = core::hint::black_box(h.len.get() as u32).clamp(1, MAX_MSG as u32);
     let r = unsafe {
         if h.op == OP_WRITE {
             bpf_xdp_load_bytes(ctx.ctx, DATA_OFF as u32, mem, len)
